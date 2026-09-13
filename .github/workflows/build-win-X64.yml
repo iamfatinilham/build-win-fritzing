@@ -1,0 +1,211 @@
+name: Build Fritzing on Windows x64
+
+on:
+  # Manual-only: a push, pull request, or schedule never uses hosted minutes.
+  workflow_dispatch:
+    inputs:
+      fritzing_ref:
+        description: 'Fritzing app branch, tag, or 40-character commit'
+        required: false
+        default: develop
+        type: string
+      fritzing_parts_ref:
+        description: 'Fritzing parts branch, tag, or 40-character commit'
+        required: false
+        default: develop
+        type: string
+      publish_release:
+        description: 'Create or update a GitHub release after the build'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      fritzing_ref:
+        required: false
+        default: develop
+        type: string
+      fritzing_parts_ref:
+        required: false
+        default: develop
+        type: string
+      publish_release:
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fritzing-windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Native x64 package
+    runs-on: windows-2022
+    outputs:
+      fritzing_version: ${{ steps.build.outputs.fritzing_version }}
+      fritzing_commit: ${{ steps.build.outputs.fritzing_commit }}
+      parts_commit: ${{ steps.build.outputs.parts_commit }}
+      qt_version: ${{ steps.build.outputs.qt_version }}
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # Check out before selecting Qt: phoenix.pro is the authoritative source
+      # for the supported Qt range and dependency directory contracts.
+      - name: Checkout Fritzing app
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: fritzing/fritzing-app
+          ref: ${{ inputs.fritzing_ref }}
+          path: work/fritzing-app
+          persist-credentials: false
+
+      - name: Checkout Fritzing parts
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: fritzing/fritzing-parts
+          ref: ${{ inputs.fritzing_parts_ref }}
+          path: work/fritzing-parts
+          persist-credentials: false
+
+      - name: Read Fritzing build contract
+        id: contract
+        shell: pwsh
+        run: |
+          $contract = & .ci\windows\Get-FritzingBuildContract.ps1 -ProjectFile work\fritzing-app\phoenix.pro
+          $contract | Format-List | Out-String | Write-Host
+          "contract_key=$($contract.Libgit2Version)-$($contract.QuaZipVersion)-$($contract.ClipperVersion)-$($contract.BoostVersion)-$($contract.SvgppVersion)-$($contract.NgspiceVersion)" >> $env:GITHUB_OUTPUT
+
+      - name: Install aqt
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --quiet aqtinstall==3.3.0
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install aqtinstall (exit code $LASTEXITCODE)." }
+
+      - name: Resolve an exact compatible Qt version
+        id: qt-version
+        shell: pwsh
+        run: |
+          $qt = & .ci\windows\Resolve-FritzingQtVersion.ps1 -ProjectFile work\fritzing-app\phoenix.pro -QtHost windows -Architecture win64_msvc2022_64
+          $qt | Format-List | Out-String | Write-Host
+          "qt_version=$($qt.QtVersion)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore exact Qt kit
+        id: qt-cache
+        uses: actions/cache@v6
+        with:
+          path: Qt
+          key: fritzing-qt-v3-windows-x64-${{ steps.qt-version.outputs.qt_version }}-win64_msvc2022_64-qtserialport-qt5compat-${{ hashFiles('.ci/windows/Resolve-FritzingQtVersion.ps1') }}
+
+      - name: Install exact compatible Qt kit
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          QT_VERSION: ${{ steps.qt-version.outputs.qt_version }}
+        run: |
+          & python -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2022_64 --autodesktop --outputdir Qt --modules qtserialport qt5compat
+          if ($LASTEXITCODE -ne 0) { throw "aqt failed to install Qt $env:QT_VERSION." }
+
+      - name: Verify selected Qt kit
+        id: qt
+        shell: pwsh
+        run: |
+          $qtVersion = '${{ steps.qt-version.outputs.qt_version }}'
+          $kits = @(Get-ChildItem -LiteralPath (Join-Path Qt $qtVersion) -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\qmake.exe') })
+          if ($kits.Count -ne 1) { throw "Expected one usable Qt kit under Qt\\$qtVersion; found $($kits.Count)." }
+          $qtRoot = $kits[0].FullName
+          $qmake = Join-Path $qtRoot 'bin\qmake.exe'
+          $version = (& $qmake -query QT_VERSION).Trim()
+          $contract = & .ci\windows\Get-FritzingBuildContract.ps1 -ProjectFile work\fritzing-app\phoenix.pro
+          if ([version]$version -lt [version]$contract.QtMinimum -or [version]$version -gt [version]$contract.QtMaximum) {
+            throw "Qt $version is outside Fritzing's declared range $($contract.QtRange)."
+          }
+          foreach ($file in 'qmake.exe', 'windeployqt.exe', 'Qt6Core5Compat.dll', 'Qt6SerialPort.dll', 'Qt6Svg.dll', 'Qt6SvgWidgets.dll') {
+            if (-not (Test-Path -LiteralPath (Join-Path $qtRoot "bin\\$file"))) { throw "The selected Qt kit lacks $file." }
+          }
+          "QT_ROOT_DIR=$qtRoot" >> $env:GITHUB_ENV
+          (Join-Path $qtRoot 'bin') | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
+          "qt_version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up native MSVC x64 environment
+        id: msvc
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe was not found at $vswhere" }
+          $vcvars = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Auxiliary\Build\vcvars64.bat' | Select-Object -First 1
+          if (-not $vcvars) { throw 'Visual Studio 2022 x64 C++ build tools were not found.' }
+          $environment = & cmd.exe /d /s /c "call `"$vcvars`" amd64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit code $LASTEXITCODE." }
+          foreach ($line in $environment) {
+            if ($line -match '^(PATH|INCLUDE|LIB|LIBPATH|VCINSTALLDIR|VCToolsVersion|WindowsSDKVersion|VisualStudioVersion)=(.*)$') {
+              "$($Matches[1])=$($Matches[2])" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+            }
+          }
+          $toolset = ($environment | Where-Object { $_ -match '^VCToolsVersion=' } | Select-Object -First 1) -replace '^VCToolsVersion=', ''
+          if ([string]::IsNullOrWhiteSpace($toolset)) { throw 'MSVC did not report VCToolsVersion.' }
+          "toolset=$toolset" >> $env:GITHUB_OUTPUT
+
+      - name: Restore compatible dependency cache
+        id: dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            work/zlib
+            work/libgit2-*
+            work/quazip-*
+            work/Clipper1-*
+            work/boost_*
+            work/svgpp-*
+            work/ngspice-*
+          key: fritzing-deps-v8-windows-x64-msvc-${{ steps.msvc.outputs.toolset }}-qt-${{ steps.qt.outputs.qt_version }}-${{ steps.contract.outputs.contract_key }}-${{ hashFiles('.ci/windows/**') }}
+
+      - name: Build, verify, and package x64
+        id: build
+        shell: pwsh
+        env:
+          FRITZING_REF: ${{ inputs.fritzing_ref }}
+          FRITZING_PARTS_REF: ${{ inputs.fritzing_parts_ref }}
+        run: |
+          .ci\windows\build-windows.ps1 -Architecture x64 -FritzingRef $env:FRITZING_REF -FritzingPartsRef $env:FRITZING_PARTS_REF -FritzingAppPath work\fritzing-app -FritzingPartsPath work\fritzing-parts
+
+      - name: Upload x64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fritzing-Windows-x64
+          if-no-files-found: error
+          path: artifacts/*.zip
+
+  # Publishing is explicit and limited to main. Normal manual builds stay
+  # read-only and do not receive release permissions.
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: inputs.publish_release && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Fritzing-Windows-x64
+          path: release
+      - name: Create release
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          tag_name: ${{ needs.build.outputs.fritzing_version }}
+          name: Fritzing ${{ needs.build.outputs.fritzing_version }}
+          body: |
+            Native Windows x64 build.
+
+            Fritzing commit: ${{ needs.build.outputs.fritzing_commit }}
+            Parts commit: ${{ needs.build.outputs.parts_commit }}
+            Qt: ${{ needs.build.outputs.qt_version }}
+            Build scripts commit: ${{ github.sha }}
+          files: release/*.zip

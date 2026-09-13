@@ -1,0 +1,66 @@
+stages:
+  - build
+  - package
+
+# GitLab uses a web pipeline for the “Run pipeline” button. Do not create a
+# pipeline for a push, merge request, schedule, or any other automatic event.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+# These jobs require self-hosted Windows runners. Set QT_ROOT_DIR on each
+# runner to a Qt MSVC kit supported by the checked-out Fritzing revision, and
+# set the ARM64 archive URL as a protected masked CI/CD variable.
+.windows-build:
+  stage: build
+  script:
+    - |
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      $vcvars = & $vswhere -latest -products * -find 'VC\Auxiliary\Build\vcvarsall.bat' | Select-Object -First 1
+      if (-not $vcvars) { throw 'Visual Studio Build Tools were not found.' }
+      cmd.exe /d /s /c "call `"$vcvars`" $env:MSVC_TARGET >nul && pwsh -NoProfile -ExecutionPolicy Bypass -File .ci\windows\build-windows.ps1 -Architecture $env:FRITZING_ARCH -NgspiceArchiveUrl `"$env:NGSPICE_URL`""
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - artifacts/*.zip
+
+build:x64:
+  extends: .windows-build
+  tags: [windows, x64]
+  variables:
+    FRITZING_ARCH: x64
+    MSVC_TARGET: amd64
+    NGSPICE_URL: ''
+
+build:arm64:
+  extends: .windows-build
+  tags: [windows, arm64]
+  variables:
+    FRITZING_ARCH: arm64
+    MSVC_TARGET: arm64
+    NGSPICE_URL: $NGSPICE_ARM64_ARCHIVE_URL
+
+build:universal:
+  stage: package
+  needs:
+    - job: build:x64
+      artifacts: true
+    - job: build:arm64
+      artifacts: true
+  tags: [windows, x64]
+  script:
+    - |
+      $packages = @(Get-ChildItem -LiteralPath artifacts -File -Filter 'Fritzing-*-Portable-Windows-*.zip')
+      $x64 = @($packages | Where-Object Name -match '-x64\.zip$')
+      $arm64 = @($packages | Where-Object Name -match '-arm64\.zip$')
+      if ($x64.Count -ne 1 -or $arm64.Count -ne 1) { throw "Expected one x64 and one ARM64 portable ZIP; found x64=$($x64.Count), arm64=$($arm64.Count)." }
+      $destination = 'artifacts\Fritzing-Windows-Universal.zip'
+      Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+      Compress-Archive -Path 'artifacts\Fritzing-*-Portable-Windows-*.zip' -DestinationPath $destination -CompressionLevel Optimal
+      if (-not (Test-Path -LiteralPath $destination) -or (Get-Item -LiteralPath $destination).Length -le 0) { throw 'The universal ZIP was not created or is empty.' }
+  artifacts:
+    expire_in: 14 days
+    paths:
+      - artifacts/Fritzing-Windows-Universal.zip

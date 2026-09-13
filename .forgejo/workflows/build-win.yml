@@ -1,0 +1,57 @@
+name: Build Fritzing for Windows
+
+on:
+  # Manual only: pushes never start a build.
+  workflow_dispatch:
+
+# Requires two self-hosted Forgejo runners: [self-hosted, windows, x64] and
+# [self-hosted, windows, arm64]. QT_ROOT_DIR must be configured by the runner.
+jobs:
+  x64:
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build x64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vcvars = & $vswhere -latest -products * -find 'VC\Auxiliary\Build\vcvarsall.bat' | Select-Object -First 1
+          if (-not $vcvars) { throw 'Visual Studio x64 C++ build tools were not found.' }
+          cmd.exe /d /s /c "call `"$vcvars`" amd64 >nul && pwsh -NoProfile -ExecutionPolicy Bypass -File .ci\windows\build-windows.ps1 -Architecture x64"
+      - uses: actions/upload-artifact@v4
+        with: { name: Fritzing-Windows-x64, path: artifacts/*.zip, if-no-files-found: error }
+  arm64:
+    runs-on: [self-hosted, windows, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ARM64
+        shell: pwsh
+        env:
+          NGSPICE_URL: ${{ secrets.NGSPICE_ARM64_ARCHIVE_URL }}
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vcvars = & $vswhere -latest -products * -find 'VC\Auxiliary\Build\vcvarsall.bat' | Select-Object -First 1
+          cmd.exe /d /s /c "call `"$vcvars`" arm64 >nul && pwsh -NoProfile -ExecutionPolicy Bypass -File .ci\windows\build-windows.ps1 -Architecture arm64 -NgspiceArchiveUrl `"$env:NGSPICE_URL`""
+      - uses: actions/upload-artifact@v4
+        with: { name: Fritzing-Windows-arm64, path: artifacts/*.zip, if-no-files-found: error }
+  universal:
+    needs: [x64, arm64]
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Fritzing-Windows-*
+          path: universal
+          merge-multiple: false
+      - name: Bundle native packages
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem -LiteralPath universal -Recurse -File -Filter 'Fritzing-*-Portable-Windows-*.zip')
+          $x64 = @($packages | Where-Object Name -match '-x64\.zip$')
+          $arm64 = @($packages | Where-Object Name -match '-arm64\.zip$')
+          if ($x64.Count -ne 1 -or $arm64.Count -ne 1) { throw "Expected one x64 and one ARM64 portable ZIP; found x64=$($x64.Count), arm64=$($arm64.Count)." }
+          Remove-Item -LiteralPath 'Fritzing-Windows-Universal.zip' -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path 'universal\*' -DestinationPath 'Fritzing-Windows-Universal.zip' -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath 'Fritzing-Windows-Universal.zip') -or (Get-Item -LiteralPath 'Fritzing-Windows-Universal.zip').Length -le 0) { throw 'The universal ZIP was not created or is empty.' }
+      - uses: actions/upload-artifact@v4
+        with: { name: Fritzing-Windows-Universal, path: Fritzing-Windows-Universal.zip, if-no-files-found: error }

@@ -1,0 +1,85 @@
+name: Build Fritzing Windows Universal package
+
+on:
+  workflow_dispatch:
+    inputs:
+      fritzing_ref:
+        description: 'Fritzing app branch, tag, or 40-character commit'
+        required: false
+        default: develop
+        type: string
+      fritzing_parts_ref:
+        description: 'Fritzing parts branch, tag, or 40-character commit'
+        required: false
+        default: develop
+        type: string
+      ngspice_arm64_archive_url:
+        description: 'Optional override for the NGSPICE_ARM64_ARCHIVE_URL secret'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      fritzing_ref:
+        required: false
+        default: develop
+        type: string
+      fritzing_parts_ref:
+        required: false
+        default: develop
+        type: string
+      ngspice_arm64_archive_url:
+        required: false
+        type: string
+    secrets:
+      NGSPICE_ARM64_ARCHIVE_URL:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    uses: ./.github/workflows/build-win-X64.yml
+    with:
+      fritzing_ref: ${{ inputs.fritzing_ref }}
+      fritzing_parts_ref: ${{ inputs.fritzing_parts_ref }}
+      publish_release: false
+
+  arm64:
+    uses: ./.github/workflows/build-win-ARM64.yml
+    with:
+      fritzing_ref: ${{ inputs.fritzing_ref }}
+      fritzing_parts_ref: ${{ inputs.fritzing_parts_ref }}
+      ngspice_arm64_archive_url: ${{ inputs.ngspice_arm64_archive_url }}
+    secrets: inherit
+
+  universal:
+    name: Bundle x64 and ARM64 packages
+    needs: [x64, arm64]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Fritzing-Windows-*
+          path: universal
+          merge-multiple: false
+      - name: Create the universal package
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem -LiteralPath universal -Recurse -File -Filter 'Fritzing-*-Portable-Windows-*.zip')
+          $x64 = @($packages | Where-Object Name -match '-x64\.zip$')
+          $arm64 = @($packages | Where-Object Name -match '-arm64\.zip$')
+          if ($x64.Count -ne 1 -or $arm64.Count -ne 1) {
+            throw "Expected exactly one x64 and one ARM64 portable ZIP; found x64=$($x64.Count), arm64=$($arm64.Count)."
+          }
+          $destination = 'Fritzing-Windows-Universal.zip'
+          Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path 'universal\*' -DestinationPath $destination -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $destination) -or (Get-Item -LiteralPath $destination).Length -le 0) {
+            throw 'The universal ZIP was not created or is empty.'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fritzing-Windows-Universal
+          path: Fritzing-Windows-Universal.zip
+          if-no-files-found: error
